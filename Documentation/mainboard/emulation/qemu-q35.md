@@ -100,6 +100,8 @@ make olddefconfig && make -j$(nproc)
 src/mainboard/emulation/qemu-q35/s3-verify.sh build/coreboot.rom
 ```
 
+Captured smoke output from QEMU 8.2.2: ``Documentation/mainboard/emulation/qemu-q35-s3-verify.txt``.
+
 Linux check after a real guest suspend/resume:
 
 ```text
