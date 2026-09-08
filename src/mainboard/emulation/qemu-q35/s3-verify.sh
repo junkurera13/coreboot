@@ -14,7 +14,7 @@
 #   s3-verify.sh [coreboot.rom]
 #   COREBOOT_ROM=build/coreboot.rom s3-verify.sh
 #
-# Requires: qemu-system-x86_64, python3
+# Requires: qemu-system-x86_64, python3, gcc -m32 (for waking-vector payload)
 set -euo pipefail
 
 ROM="${1:-${COREBOOT_ROM:-build/coreboot.rom}}"
@@ -24,6 +24,9 @@ WORKDIR="${WORKDIR:-$(mktemp -d /tmp/q35-s3-XXXXXX)}"
 QMP="${WORKDIR}/qmp.sock"
 SERIAL="${WORKDIR}/serial.log"
 PIDFILE="${WORKDIR}/qemu.pid"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "${HERE}/../../../.." && pwd)"
+CBFSTOOL="${CBFSTOOL:-${ROOT}/build/cbfstool}"
 
 cleanup() {
 	if [[ -f "${PIDFILE}" ]]; then
@@ -156,11 +159,29 @@ wait_serial_from() {
 echo "ROM=${ROM}"
 echo "WORKDIR=${WORKDIR}"
 
+TEST_ROM="${WORKDIR}/coreboot.rom"
+cp "${ROM}" "${TEST_ROM}"
+PAYLOAD_ELF="${WORKDIR}/s3-wvec.elf"
+HAVE_WVEC=0
+if command -v gcc >/dev/null && [[ -x "${CBFSTOOL}" ]] && [[ -f "${HERE}/s3-wvec-payload.c" ]]; then
+	if gcc -m32 -nostdlib -fno-pic -fno-stack-protector -static \
+		-Wl,-T,"${HERE}/s3-wvec.ld" -Wl,--build-id=none -s \
+		-o "${PAYLOAD_ELF}" "${HERE}/s3-wvec-payload.c"; then
+		"${CBFSTOOL}" "${TEST_ROM}" add-payload -f "${PAYLOAD_ELF}" -n fallback/payload
+		HAVE_WVEC=1
+		echo "Added S3 waking-vector payload to test ROM"
+	else
+		echo "warning: gcc -m32 payload build failed; skipping vector inject" >&2
+	fi
+else
+	echo "warning: gcc/cbfstool missing; skipping waking-vector payload" >&2
+fi
+
 "${QEMU}" \
 	-M q35 \
 	-smp 1 \
 	-m 1G \
-	-bios "${ROM}" \
+	-bios "${TEST_ROM}" \
 	-display none \
 	-serial "file:${SERIAL}" \
 	-qmp "unix:${QMP},server,nowait" \
@@ -174,8 +195,17 @@ if ! wait_serial "Q35 S3:.*s3resume=" "${TIMEOUT_SEC}"; then
 	exit 1
 fi
 
-# Finish ramstage so PMBASE stays programmed before the PM1_CNT S3 write.
-wait_serial "Payload not loaded|Jumping to|Boot failed" "${TIMEOUT_SEC}" || true
+# Finish ramstage / payload so PMBASE stays programmed and FACS can be filled.
+if [[ "${HAVE_WVEC}" -eq 1 ]]; then
+	if ! wait_serial "S3-PAYLOAD: programmed" "${TIMEOUT_SEC}"; then
+		echo "error: waking-vector payload did not program FACS" >&2
+		serial_plain >&2 || true
+		exit 1
+	fi
+	echo "PAYLOAD: $(serial_plain | grep -E 'S3-PAYLOAD:' | tail -n 1 || true)"
+else
+	wait_serial "Payload not loaded|Jumping to|Boot failed" "${TIMEOUT_SEC}" || true
+fi
 
 cold="$(serial_plain | grep -E "Q35 S3:.*s3resume=" | tail -n 1 || true)"
 echo "COLD: ${cold}"
@@ -236,8 +266,38 @@ if ! serial_has_from "${wake_off}" "Jumping to image"; then
 	serial_plain >&2
 	exit 1
 fi
+wait_serial_from "${wake_off}" "Trying to find the wakeup vector|No FADT found" "${TIMEOUT_SEC}" || true
+if serial_has_from "${wake_off}" "No FADT found"; then
+	echo "error: S3 resume could not find FADT (need RSDT walk for QEMU ACPI 1.0)" >&2
+	serial_plain >&2
+	exit 1
+fi
+if [[ "${HAVE_WVEC}" -eq 1 ]]; then
+	if ! wait_serial_from "${wake_off}" "OS waking vector is 0x0*1000" "${TIMEOUT_SEC}"; then
+		echo "error: FACS lookup did not return 0x1000" >&2
+		serial_plain >&2
+		exit 1
+	fi
+	if ! wait_serial_from "${wake_off}" "Q35VEC" "${TIMEOUT_SEC}"; then
+		echo "error: waking-vector stub did not print Q35VEC (jump may have failed)" >&2
+		echo "HMP registers: $(qmp_cmd '{"execute":"human-monitor-command","arguments":{"command-line":"info registers"}}')" >&2
+		echo "HMP stub: $(qmp_cmd '{"execute":"human-monitor-command","arguments":{"command-line":"xp /32xb 0x1000"}}')" >&2
+		serial_plain >&2
+		exit 1
+	fi
+	echo "PASS: QEMU q35 S3 detect, TSEG cache resume, and FACS waking-vector jump"
+else
+	if ! wait_serial_from "${wake_off}" "FADT found|No FADT found" "${TIMEOUT_SEC}"; then
+		true
+	fi
+	if serial_has_from "${wake_off}" "No FADT found"; then
+		echo "error: S3 resume could not find FADT (need RSDT walk for QEMU ACPI 1.0)" >&2
+		serial_plain >&2
+		exit 1
+	fi
+	echo "PASS: QEMU q35 firmware distinguished cold boot vs S3 wake and resumed without reset"
+fi
 
-echo "PASS: QEMU q35 firmware distinguished cold boot vs S3 wake and resumed without reset"
 echo "SERIAL=${SERIAL}"
 # Keep logs for the caller; do not delete WORKDIR on success.
 trap - EXIT

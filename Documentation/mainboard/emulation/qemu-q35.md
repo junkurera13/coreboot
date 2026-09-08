@@ -79,14 +79,18 @@ Wake path (QEMU 8.2+ `pc_machine_wakeup()`):
 | 6 | CBMEM lost on wake | `S3 resume: CBMEM recovery failed, cold boot` then payload. |
 | 7 | TSEG stage cache too small (`SMM_RESERVED_SIZE=0`) | Detect `s3resume=1`, then `Can't find 57a9e002 metadata in imd` / `postcar cache invalid` / `board_reset`. Next pass is a cold boot (`s3resume=0`) because the reset clears `WAK_STS`. |
 | 8 | TSEG 8MiB + `SMM_RESERVED_SIZE=0x200000` (defaults with `CPU_QEMU_X86_TSEG_SMM`) | Cold boot stashes postcar/ramstage. Wake prints `S3 Resume` and continues; no `postcar cache invalid`. |
+| 9 | QEMU ACPI 1.0 RSDP (`XSDT=0`) + FADT `x_firmware_ctl=0` | Resume must walk **RSDT** and `firmware_ctrl`, then print `FADT found` / `FACS found`. XSDT-only lookup prints `No FADT found` and never jumps. |
+| 10 | Payload programs `FACS.firmware_waking_vector` at `0x1000` then S3 | Serial: `OS waking vector is 0x00001000` then stub `Q35VEC` on COM1. Stub must be below qemu CAR (`DCACHE_RAM_BASE=0x10000`); bootblock only zeros allocated CAR, not 64KiB–640KiB unused DRAM. |
 
-On default `qemu-system-x86_64 -M q35`, coreboot loads QEMU's fw_cfg ACPI tables first and does **not** install the CBFS DSDT. Linux then sees QEMU's DSDT, which already uses `SLP_TYP 1` for S3 when `ICH9-LPC.disable_s3` is off. The CBFS `_S3={1,1,0,0}` still matters if ACPI build is off (`-machine acpi=off`) so coreboot's own DSDT is used. Firmware wake detection always uses `WAK_STS`, not the DSDT.
+On default `qemu-system-x86_64 -M q35`, coreboot loads QEMU's fw_cfg ACPI tables first and does **not** install the CBFS DSDT. Linux then sees QEMU's DSDT, which already uses `SLP_TYP 1` for S3 when `ICH9-LPC.disable_s3` is off. The CBFS `_S3={1,1,0,0}` still matters if ACPI build is off (`-machine acpi=off`) so coreboot's own DSDT is used. Firmware wake detection always uses `WAK_STS`, not the DSDT. The waking-vector jump uses the low-memory RSDP copy (often QEMU's ACPI 1.0 RSDP).
 
 Stock Dasharo `configs/config.emulation_qemu_x86_q35_uefi` uses `CONFIG_DEFAULT_CONSOLE_LOGLEVEL_0`. S3 detect is printed at `BIOS_EMERG` so it still appears. For PM1 dumps on cold boot, use loglevel 6+ or `configs/config.emulation_qemu_x86_q35_s3_smoke`.
 
 The board selects `DASHARO_PREFER_S3_SLEEP` so the EDK2 payload is built with S3 as the default sleep (otherwise `PAYLOAD_EDK2` defaults `DASHARO_PREFER_S3_SLEEP` off / S0ix).
 
 `HAVE_ACPI_RESUME` plus `SMM_TSEG` selects `TSEG_STAGE_CACHE`. qemu-q35 must set `SMM_RESERVED_SIZE` (2MiB) and a larger TSEG (8MiB): `CBMEM_STAGE_CACHE` is unavailable while TSEG SMM is on, and a zero-sized TSEG subregion makes detect-then-reset look like a failed S3.
+
+On QEMU, cache-as-RAM is ordinary DRAM at `DCACHE_RAM_BASE` (`0x10000`) for `DCACHE_RAM_SIZE` (up to VGA at `0xa0000`). Bootblock zeros only allocated CAR objects (`_car_region_start` through `_car_unallocated_start`), not the unused tail. Wiping 64KiB–640KiB on every reset would erase a guest `firmware_waking_vector` before ramstage jumped to it.
 
 Firmware-only script (no Ubuntu disk):
 
