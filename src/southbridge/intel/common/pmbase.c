@@ -78,6 +78,17 @@ u8 read_pmbase8(const u8 addr)
 
 int acpi_get_sleep_type(void)
 {
+	/*
+	 * QEMU's ACPI PM (hw/acpi/core.c) maps SLP_TYP 1 to S3 and 0 to S5,
+	 * unlike ICH9 (5 and 7). On wake it also resets PM1_CNT, so SLP_TYP is
+	 * no longer S3, while PM1_STS.WAK_STS remains set. Treat WAK_STS as
+	 * S3 once PMBASE is programmed; real ICH9 still uses SLP_TYP below.
+	 */
+	if (CONFIG(BOARD_EMULATION_QEMU_X86_Q35)) {
+		if (lpc_get_pmbase() && (read_pmbase16(PM1_STS) & WAK_STS))
+			return ACPI_S3;
+	}
+
 	return acpi_sleep_from_pm1(read_pmbase32(PM1_CNT));
 }
 
@@ -87,8 +98,12 @@ int acpi_get_sleep_type(void)
  */
 int platform_is_resuming(void)
 {
-	u16 reg16 = read_pmbase16(PM1_STS);
+	u16 reg16;
 
+	if (!lpc_get_pmbase())
+		return 0;
+
+	reg16 = read_pmbase16(PM1_STS);
 	if (!(reg16 & WAK_STS))
 		return 0;
 
@@ -99,9 +114,15 @@ void poweroff(void)
 {
 	uint32_t pm1_cnt;
 
-	/* Go to S5 */
 	pm1_cnt = read_pmbase32(PM1_CNT);
-	pm1_cnt |= (0xf << 10);
+	if (CONFIG(BOARD_EMULATION_QEMU_X86_Q35)) {
+		/* QEMU ACPI PM: SLP_TYP 0 + SLP_EN is soft-off. */
+		pm1_cnt &= ~SLP_TYP;
+		pm1_cnt |= SLP_EN;
+	} else {
+		/* Go to S5 (SLP_TYP=7 | SLP_EN). */
+		pm1_cnt |= (0xf << 10);
+	}
 	write_pmbase32(PM1_CNT, pm1_cnt);
 }
 
