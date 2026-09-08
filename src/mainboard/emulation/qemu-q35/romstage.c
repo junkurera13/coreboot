@@ -41,7 +41,14 @@ void mainboard_romstage_entry(void)
 	 * here so ramstage can recover CBMEM and jump to the FACS vector.
 	 */
 	s3resume = southbridge_detect_s3_resume();
-	printk(BIOS_DEBUG, "Q35 S3: PM1_STS=0x%04x PM1_CNT=0x%08x s3resume=%d\n",
+	/*
+	 * Dasharo qemu-q35 UEFI images default to loglevel 0 (EMERG only).
+	 * Print resume at BIOS_EMERG so serial evidence is visible on stock
+	 * images; cold boot stays at BIOS_INFO for the high-loglevel smoke
+	 * config.
+	 */
+	printk(s3resume ? BIOS_EMERG : BIOS_INFO,
+	       "Q35 S3: PM1_STS=0x%04x PM1_CNT=0x%08x s3resume=%d\n",
 	       read_pmbase16(PM1_STS), read_pmbase32(PM1_CNT), s3resume);
 
 	if (cbmem_recovery(s3resume)) {
