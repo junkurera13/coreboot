@@ -111,12 +111,41 @@ serial_has() {
 	[[ -f "${SERIAL}" ]] && grep -aE "$1" "${SERIAL}" >/dev/null
 }
 
+# Match only bytes written after offset (so cold-boot strings cannot satisfy
+# post-wake waits). grep -q on a pipe is unsafe with set -o pipefail.
+serial_has_from() {
+	local off="$1"
+	local pat="$2"
+	[[ -f "${SERIAL}" ]] || return 1
+	python3 - "${SERIAL}" "${off}" "${pat}" <<'PY'
+import re, sys
+
+path, off, pat = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+data = open(path, "rb").read()[off:]
+sys.exit(0 if re.search(pat.encode(), data) else 1)
+PY
+}
+
 wait_serial() {
 	local pattern="$1"
 	local seconds="$2"
 	local deadline=$((SECONDS + seconds))
 	while (( SECONDS < deadline )); do
 		if serial_has "${pattern}"; then
+			return 0
+		fi
+		sleep 0.2
+	done
+	return 1
+}
+
+wait_serial_from() {
+	local off="$1"
+	local pattern="$2"
+	local seconds="$3"
+	local deadline=$((SECONDS + seconds))
+	while (( SECONDS < deadline )); do
+		if serial_has_from "${off}" "${pattern}"; then
 			return 0
 		fi
 		sleep 0.2
@@ -161,9 +190,13 @@ echo "STATUS before S3: $(qmp_cmd '{"execute":"query-status"}')"
 echo "HMP out PM1_CNT: $(qmp_cmd '{"execute":"human-monitor-command","arguments":{"command-line":"o 0x605 0x24"}}')"
 sleep 1
 echo "STATUS after S3 write: $(qmp_cmd '{"execute":"query-status"}')"
+wake_off=0
+if [[ -f "${SERIAL}" ]]; then
+	wake_off="$(wc -c < "${SERIAL}")"
+fi
 echo "WAKEUP: $(qmp_cmd '{"execute":"system_wakeup"}')"
 
-if ! wait_serial "s3resume=1" "${TIMEOUT_SEC}"; then
+if ! wait_serial_from "${wake_off}" "s3resume=1" "${TIMEOUT_SEC}"; then
 	echo "error: timed out waiting for S3 resume detect" >&2
 	echo "----- serial -----" >&2
 	serial_plain >&2 || true
@@ -175,26 +208,31 @@ echo "WAKE: ${resume}"
 
 # Detection alone is not enough: zero TSEG stage cache prints s3resume=1 then
 # postcar_cache_invalid() -> board_reset(), which clears WAK_STS.
-wait_serial "S3 Resume|postcar cache invalid" "${TIMEOUT_SEC}" || true
-wait_serial "Jumping to image|Payload not loaded|postcar cache invalid|board_reset" "${TIMEOUT_SEC}" || true
-
-if serial_has "postcar cache invalid"; then
-	echo "error: S3 detected but postcar stage cache was empty/invalid" >&2
-	serial_plain >&2
-	exit 1
-fi
-if serial_has "Can't find 57a9e002 metadata"; then
-	echo "error: S3 detected but postcar was not in the TSEG stage cache" >&2
-	serial_plain >&2
-	exit 1
-fi
-if ! serial_has "S3 Resume"; then
+# Search only post-wake bytes so cold-boot "Payload not loaded" cannot match.
+if ! wait_serial_from "${wake_off}" "S3 Resume" "${TIMEOUT_SEC}"; then
 	echo "error: missing romstage_handoff S3 Resume after s3resume=1" >&2
 	serial_plain >&2
 	exit 1
 fi
-if serial_has "board_reset"; then
+wait_serial_from "${wake_off}" "Jumping to image|postcar cache invalid|board_reset" "${TIMEOUT_SEC}" || true
+
+if serial_has_from "${wake_off}" "postcar cache invalid"; then
+	echo "error: S3 detected but postcar stage cache was empty/invalid" >&2
+	serial_plain >&2
+	exit 1
+fi
+if serial_has_from "${wake_off}" "Can't find 57a9e002 metadata"; then
+	echo "error: S3 detected but postcar was not in the TSEG stage cache" >&2
+	serial_plain >&2
+	exit 1
+fi
+if serial_has_from "${wake_off}" "board_reset"; then
 	echo "error: S3 resume path reset the board (not a successful resume)" >&2
+	serial_plain >&2
+	exit 1
+fi
+if ! serial_has_from "${wake_off}" "Jumping to image"; then
+	echo "error: postcar did not jump to cached ramstage on S3 resume" >&2
 	serial_plain >&2
 	exit 1
 fi
