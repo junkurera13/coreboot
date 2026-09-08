@@ -98,8 +98,17 @@ PY
 }
 
 serial_plain() {
-	# Strip coreboot ANSI so grep matches the Q35 S3 line reliably.
-	sed 's/\x1b\[[0-9;]*m//g' "${SERIAL}" 2>/dev/null || true
+	# Strip ANSI and CR so displayed lines and grep stay stable.
+	# Do not pipe a huge buffer into grep -q under `set -o pipefail`:
+	# grep -q exits early and echo gets SIGPIPE, which looks like a miss.
+	if [[ ! -f "${SERIAL}" ]]; then
+		return 0
+	fi
+	tr -d '\r' < "${SERIAL}" | sed 's/\x1b\[[0-9;]*m//g' || true
+}
+
+serial_has() {
+	[[ -f "${SERIAL}" ]] && grep -aE "$1" "${SERIAL}" >/dev/null
 }
 
 wait_serial() {
@@ -107,7 +116,7 @@ wait_serial() {
 	local seconds="$2"
 	local deadline=$((SECONDS + seconds))
 	while (( SECONDS < deadline )); do
-		if [[ -f "${SERIAL}" ]] && serial_plain | grep -qE "${pattern}"; then
+		if serial_has "${pattern}"; then
 			return 0
 		fi
 		sleep 0.2
@@ -141,7 +150,7 @@ wait_serial "Payload not loaded|Jumping to|Boot failed" "${TIMEOUT_SEC}" || true
 
 cold="$(serial_plain | grep -E "Q35 S3:.*s3resume=" | tail -n 1 || true)"
 echo "COLD: ${cold}"
-if echo "${cold}" | grep -q "s3resume=1"; then
+if serial_has "s3resume=1"; then
 	echo "error: cold boot was detected as S3 resume" >&2
 	exit 1
 fi
@@ -166,29 +175,27 @@ echo "WAKE: ${resume}"
 
 # Detection alone is not enough: zero TSEG stage cache prints s3resume=1 then
 # postcar_cache_invalid() -> board_reset(), which clears WAK_STS.
-wait_serial "S3 Resume|postcar cache invalid|OS waking vector" "${TIMEOUT_SEC}" || true
-# Let ramstage finish or reset so failure strings are in the log.
-sleep 2
+wait_serial "S3 Resume|postcar cache invalid" "${TIMEOUT_SEC}" || true
+wait_serial "Jumping to image|Payload not loaded|postcar cache invalid|board_reset" "${TIMEOUT_SEC}" || true
 
-plain="$(serial_plain)"
-if echo "${plain}" | grep -q "postcar cache invalid"; then
+if serial_has "postcar cache invalid"; then
 	echo "error: S3 detected but postcar stage cache was empty/invalid" >&2
-	echo "${plain}" >&2
+	serial_plain >&2
 	exit 1
 fi
-if echo "${plain}" | grep -q "Can't find 57a9e002 metadata"; then
+if serial_has "Can't find 57a9e002 metadata"; then
 	echo "error: S3 detected but postcar was not in the TSEG stage cache" >&2
-	echo "${plain}" >&2
+	serial_plain >&2
 	exit 1
 fi
-if ! echo "${plain}" | grep -q "S3 Resume"; then
+if ! serial_has "S3 Resume"; then
 	echo "error: missing romstage_handoff S3 Resume after s3resume=1" >&2
-	echo "${plain}" >&2
+	serial_plain >&2
 	exit 1
 fi
-if echo "${plain}" | grep -q "board_reset"; then
+if serial_has "board_reset"; then
 	echo "error: S3 resume path reset the board (not a successful resume)" >&2
-	echo "${plain}" >&2
+	serial_plain >&2
 	exit 1
 fi
 
